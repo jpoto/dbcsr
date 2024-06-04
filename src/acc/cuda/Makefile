@@ -57,7 +57,7 @@ WITH_GPU := $(if $(WITH_GPU),$(WITH_GPU),$(GPUVER))
 ifeq (,$(WITH_GPU))
   ifneq (,$(call which,nvidia-smi))
     GPU_NAME := $(shell nvidia-smi --query-gpu=gpu_name --format=csv,noheader -i 0 2>/dev/null | tr -c [:alnum:] " ")
-    WITH_GPU := $(filter K20X K40 K80 P100 V100 A100 H100,$(GPU_NAME))
+    WITH_GPU := $(filter K20X K40 K80 P100 V100 A100 A40 H100,$(GPU_NAME))
   endif
 endif
 ifeq (,$(WITH_GPU))
@@ -79,6 +79,8 @@ else ifeq ($(WITH_GPU),V100)
   ARCH_NUMBER = 70
 else ifeq ($(WITH_GPU),A100)
   ARCH_NUMBER = 80
+else ifeq ($(WITH_GPU),A40)
+  ARCH_NUMBER = 86
 else ifeq ($(WITH_GPU),H100)
   # TODO: update for H100 tuned parameters
   override WITH_GPU := A100
