@@ -1289,6 +1289,8 @@ CONTAINS
 !   ---------------------------------------------------------------------------
 
       CALL timeset(routineN, handle)
+      IF (matrix_a%async_pending) &
+         DBCSR_ABORT("dbcsr_copy: source has a pending asynchronous multiplication")
       IF (.NOT. symmetry_consistent(dbcsr_get_matrix_type(matrix_a), dbcsr_get_data_type(matrix_a))) &
          DBCSR_ABORT("Source matrix symmetry not consistent with its data type.")
       shallow = .FALSE.; IF (PRESENT(shallow_data)) shallow = shallow_data
@@ -1969,6 +1971,8 @@ CONTAINS
 !   ---------------------------------------------------------------------------
 
       CALL timeset(routineN, handle)
+      IF (matrix%async_pending) &
+         DBCSR_ABORT("dbcsr_filter: matrix has a pending asynchronous multiplication")
       my_method = dbcsr_filter_frobenius
       IF (PRESENT(method)) my_method = method
       my_absolute = 1.0_dp

@@ -17,6 +17,7 @@ MODULE dbcsr_data_methods
                                acc_devmem_setzero_bytes, &
                                acc_devmem_size_in_bytes
    USE dbcsr_acc_event, ONLY: acc_event_record
+   USE dbcsr_acc_stream, ONLY: acc_stream_associated, acc_stream_synchronize
    USE dbcsr_data_methods_low, ONLY: &
       dbcsr_data_clear_pointer, dbcsr_data_exists, dbcsr_data_get_memory_type, &
       dbcsr_data_get_size, dbcsr_data_get_size_referenced, dbcsr_data_get_sizes, &
@@ -50,6 +51,17 @@ MODULE dbcsr_data_methods
 
    INTEGER, SAVE                        :: id = 0
 
+   ! Deferred data free lists used while an asynchronous (Layer A) multiply is
+   ! being launched. Memory released during the launch window is kept alive
+   ! until the corresponding slot is completed.
+   INTEGER, PARAMETER, PRIVATE :: max_retain_slots = 64
+   TYPE retain_list_type
+      TYPE(dbcsr_data_obj), DIMENSION(:), ALLOCATABLE :: areas
+      INTEGER :: n = 0
+   END TYPE retain_list_type
+   TYPE(retain_list_type), SAVE :: retained(max_retain_slots)
+   INTEGER, SAVE :: retain_slot = -1
+
    PUBLIC :: dbcsr_type_2d_to_1d, dbcsr_type_1d_to_2d
    PUBLIC :: dbcsr_scalar, dbcsr_scalar_one, dbcsr_scalar_zero, &
              dbcsr_scalar_are_equal, dbcsr_scalar_negative, &
@@ -68,6 +80,7 @@ MODULE dbcsr_data_methods
    PUBLIC :: dbcsr_get_data_p, dbcsr_get_data_p_s, dbcsr_get_data_p_c, &
              dbcsr_get_data_p_d, dbcsr_get_data_p_z
    PUBLIC :: dbcsr_data_host2dev, dbcsr_data_dev2host
+   PUBLIC :: dbcsr_data_set_retain_slot, dbcsr_data_flush_retained
 
 CONTAINS
 
@@ -443,14 +456,10 @@ CONTAINS
          area%d%refcount = area%d%refcount - 1
          ! If we're releasing the last reference, then free the memory.
          IF (area%d%refcount .EQ. 0) THEN
-            IF (.NOT. dbcsr_data_exists(area)) THEN
-               DEALLOCATE (area%d)
-            ELSE IF (dbcsr_data_get_size(area) > 1 .AND. ASSOCIATED(area%d%memory_type%pool)) THEN
-               area%d%ref_size = 0
-               CALL dbcsr_mempool_add(area)
+            IF (retain_slot .GE. 1 .AND. retain_slot .LE. max_retain_slots) THEN
+               CALL retain_data_area(retain_slot, area)
             ELSE
-               CALL internal_data_deallocate(area%d)
-               DEALLOCATE (area%d)
+               CALL free_data_area(area)
             END IF
             NULLIFY (area%d)
          END IF
@@ -459,5 +468,75 @@ CONTAINS
       CALL timestop(handle)
 
    END SUBROUTINE dbcsr_data_release
+
+   SUBROUTINE dbcsr_data_set_retain_slot(slot)
+      !! Redirect subsequent last-reference releases into the given slot's
+      !! retention list (slot < 1 disables retention).
+      INTEGER, INTENT(IN)                                :: slot
+
+      retain_slot = slot
+   END SUBROUTINE dbcsr_data_set_retain_slot
+
+   SUBROUTINE dbcsr_data_flush_retained(slot)
+      !! Releases all data areas retained for the given slot.
+      INTEGER, INTENT(IN)                                :: slot
+
+      INTEGER                                            :: i, saved_slot
+
+      IF (slot .LT. 1 .OR. slot .GT. max_retain_slots) RETURN
+!$OMP CRITICAL(dbcsr_retain_lock)
+      saved_slot = retain_slot
+      retain_slot = -1
+      DO i = 1, retained(slot)%n
+         IF (ASSOCIATED(retained(slot)%areas(i)%d)) THEN
+            IF (acc_stream_associated(retained(slot)%areas(i)%d%memory_type%acc_stream)) &
+               CALL acc_stream_synchronize(retained(slot)%areas(i)%d%memory_type%acc_stream)
+         END IF
+         CALL free_data_area(retained(slot)%areas(i))
+      END DO
+      retained(slot)%n = 0
+      retain_slot = saved_slot
+!$OMP END CRITICAL(dbcsr_retain_lock)
+   END SUBROUTINE dbcsr_data_flush_retained
+
+   SUBROUTINE retain_data_area(slot, area)
+      !! Appends a data area to the retention list of the given slot.
+      INTEGER, INTENT(IN)                                :: slot
+      TYPE(dbcsr_data_obj), INTENT(INOUT)                :: area
+
+      INTEGER                                            :: n
+      TYPE(dbcsr_data_obj), DIMENSION(:), ALLOCATABLE     :: tmp
+
+!$OMP CRITICAL(dbcsr_retain_lock)
+      n = retained(slot)%n
+      IF (.NOT. ALLOCATED(retained(slot)%areas)) THEN
+         ALLOCATE (retained(slot)%areas(64))
+      ELSE IF (n .GE. SIZE(retained(slot)%areas)) THEN
+         ALLOCATE (tmp(2*SIZE(retained(slot)%areas)))
+         tmp(1:n) = retained(slot)%areas(1:n)
+         CALL MOVE_ALLOC(tmp, retained(slot)%areas)
+      END IF
+      n = n + 1
+      retained(slot)%areas(n) = area
+      retained(slot)%n = n
+!$OMP END CRITICAL(dbcsr_retain_lock)
+   END SUBROUTINE retain_data_area
+
+   SUBROUTINE free_data_area(area)
+      !! Frees a data area whose reference count has already reached zero.
+      TYPE(dbcsr_data_obj), INTENT(INOUT)                :: area
+
+      IF (.NOT. ASSOCIATED(area%d)) RETURN
+      IF (.NOT. dbcsr_data_exists(area)) THEN
+         DEALLOCATE (area%d)
+      ELSE IF (dbcsr_data_get_size(area) > 1 .AND. ASSOCIATED(area%d%memory_type%pool)) THEN
+         area%d%ref_size = 0
+         CALL dbcsr_mempool_add(area)
+      ELSE
+         CALL internal_data_deallocate(area%d)
+         DEALLOCATE (area%d)
+      END IF
+      NULLIFY (area%d)
+   END SUBROUTINE free_data_area
 
 END MODULE dbcsr_data_methods

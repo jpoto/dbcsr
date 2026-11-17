@@ -92,6 +92,9 @@ CONTAINS
       TYPE(dbcsr_type), INTENT(INOUT)                    :: matrix
          !! DBCSR matrix
 
+      IF (matrix%async_pending) &
+         DBCSR_ABORT("dbcsr_release: matrix has a pending asynchronous multiplication")
+
       matrix%refcount = matrix%refcount - 1
       IF (matrix%refcount .EQ. 0) THEN
          CALL dbcsr_destroy(matrix)

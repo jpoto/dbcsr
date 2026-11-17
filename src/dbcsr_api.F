@@ -79,6 +79,9 @@ MODULE dbcsr_api
    USE dbcsr_mpiwrap, ONLY: mp_comm_type
    USE dbcsr_mp_methods, ONLY: dbcsr_mp_grid_setup_prv => dbcsr_mp_grid_setup
    USE dbcsr_multiply_api, ONLY: dbcsr_multiply_prv => dbcsr_multiply
+   USE dbcsr_mm_async, ONLY: dbcsr_multiply_async_prv, dbcsr_multiply_wait_prv, &
+                             dbcsr_multiply_cancel_prv, dbcsr_multiply_pending_prv, &
+                             dbcsr_async_set_enabled, dbcsr_async_get_enabled
    USE dbcsr_operations, ONLY: &
       dbcsr_add_on_diag_prv => dbcsr_add_on_diag, &
       dbcsr_add_prv => dbcsr_add, &
@@ -194,6 +197,11 @@ MODULE dbcsr_api
    PUBLIC :: dbcsr_scale_by_vector
    PUBLIC :: dbcsr_transposed
    PUBLIC :: dbcsr_multiply
+   PUBLIC :: dbcsr_async_handle_type
+   PUBLIC :: dbcsr_async_set_enabled
+   PUBLIC :: dbcsr_async_get_enabled
+   PUBLIC :: dbcsr_multiply_async, dbcsr_multiply_wait
+   PUBLIC :: dbcsr_multiply_pending, dbcsr_multiply_cancel
    PUBLIC :: dbcsr_copy
    PUBLIC :: dbcsr_copy_into_existing
    PUBLIC :: dbcsr_desymmetrize
@@ -312,6 +320,12 @@ MODULE dbcsr_api
       TYPE(dbcsr_type), POINTER :: matrix => Null()
    END TYPE dbcsr_p_type
 
+   TYPE dbcsr_async_handle_type
+      PRIVATE
+      INTEGER :: id = -1
+      LOGICAL :: pending = .FALSE.
+   END TYPE dbcsr_async_handle_type
+
    ! the components of this type must remain private to encapsulate better the internals
    ! of the dbcsr library.
    TYPE dbcsr_distribution_type
@@ -370,6 +384,11 @@ MODULE dbcsr_api
 
    INTERFACE dbcsr_multiply
       MODULE PROCEDURE dbcsr_multiply_d, dbcsr_multiply_s, dbcsr_multiply_c, dbcsr_multiply_z
+   END INTERFACE
+
+   INTERFACE dbcsr_multiply_async
+      MODULE PROCEDURE dbcsr_multiply_async_d, dbcsr_multiply_async_s
+      MODULE PROCEDURE dbcsr_multiply_async_c, dbcsr_multiply_async_z
    END INTERFACE
 
    INTERFACE dbcsr_get_block_p
@@ -1432,6 +1451,36 @@ CONTAINS
                                  flop=flop)
       END SUBROUTINE dbcsr_multiply_${nametype1}$
 
+      SUBROUTINE dbcsr_multiply_async_${nametype1}$ (transa, transb, &
+                                                     alpha, matrix_a, matrix_b, beta, matrix_c, handle, &
+                                                     first_row, last_row, first_column, last_column, first_k, last_k, &
+                                                     retain_sparsity, filter_eps, flop)
+         CHARACTER(LEN=1), INTENT(IN)             :: transa, transb
+         ${type1}$, INTENT(IN)                      :: alpha
+         TYPE(dbcsr_type), INTENT(IN)             :: matrix_a, matrix_b
+         ${type1}$, INTENT(IN)                      :: beta
+         TYPE(dbcsr_type), INTENT(INOUT)          :: matrix_c
+         TYPE(dbcsr_async_handle_type), INTENT(OUT) :: handle
+         INTEGER, INTENT(IN), OPTIONAL            :: first_row, last_row, &
+                                                     first_column, last_column, &
+                                                     first_k, last_k
+         LOGICAL, INTENT(IN), OPTIONAL            :: retain_sparsity
+         REAL(kind=${kind2[n]}$), INTENT(IN), OPTIONAL :: filter_eps
+         INTEGER(int_8), INTENT(OUT), OPTIONAL    :: flop
+
+         INTEGER                                  :: slot
+
+         CALL dbcsr_multiply_async_prv(transa, transb, &
+                                       dbcsr_scalar(alpha), matrix_a%prv, matrix_b%prv, &
+                                       dbcsr_scalar(beta), matrix_c%prv, &
+                                       first_row, last_row, first_column, last_column, first_k, last_k, &
+                                       retain_sparsity, &
+                                       filter_eps=filter_eps, &
+                                       flop=flop, slot=slot)
+         handle%id = slot
+         handle%pending = (slot >= 0) .AND. dbcsr_multiply_pending_prv(slot)
+      END SUBROUTINE dbcsr_multiply_async_${nametype1}$
+
       SUBROUTINE dbcsr_scale_by_vector_${nametype1}$ (matrix_a, alpha, side)
          TYPE(dbcsr_type), INTENT(INOUT)           :: matrix_a
          ${type1}$, DIMENSION(:), INTENT(IN), TARGET :: alpha
@@ -1503,5 +1552,30 @@ CONTAINS
          DATA => dbcsr_get_data_p_prv(matrix%prv%data_area, select_data_type, lb, ub)
       END FUNCTION dbcsr_get_data_${nametype1}$
    #:endfor
+
+   SUBROUTINE dbcsr_multiply_wait(handle)
+      !! Waits for an asynchronous multiplication to complete.
+      TYPE(dbcsr_async_handle_type), INTENT(INOUT)       :: handle
+
+      CALL dbcsr_multiply_wait_prv(handle%id)
+      handle%pending = .FALSE.
+   END SUBROUTINE dbcsr_multiply_wait
+
+   SUBROUTINE dbcsr_multiply_cancel(handle)
+      !! Cancels an asynchronous multiplication. A running multiplication is
+      !! completed before returning because it cannot be interrupted safely.
+      TYPE(dbcsr_async_handle_type), INTENT(INOUT)       :: handle
+
+      CALL dbcsr_multiply_cancel_prv(handle%id)
+      handle%pending = .FALSE.
+   END SUBROUTINE dbcsr_multiply_cancel
+
+   FUNCTION dbcsr_multiply_pending(handle) RESULT(pending)
+      !! Returns whether the given asynchronous multiplication is still pending.
+      TYPE(dbcsr_async_handle_type), INTENT(IN)          :: handle
+      LOGICAL                                            :: pending
+
+      pending = (handle%id >= 0) .AND. dbcsr_multiply_pending_prv(handle%id)
+   END FUNCTION dbcsr_multiply_pending
 
 END MODULE dbcsr_api

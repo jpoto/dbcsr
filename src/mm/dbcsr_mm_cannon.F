@@ -63,6 +63,7 @@ MODULE dbcsr_mm_cannon
       dbcsr_has_symmetry, dbcsr_image_dist_hold, dbcsr_image_dist_init, &
       dbcsr_image_dist_release, dbcsr_max_col_size, dbcsr_max_row_size, dbcsr_nblkcols_local, &
       dbcsr_nblkrows_local, dbcsr_nblkrows_total, dbcsr_release, dbcsr_valid_index
+   USE dbcsr_data_methods, ONLY: dbcsr_data_set_retain_slot
    USE dbcsr_mm_common, ONLY: &
       acc_transpose_blocks, calculate_norms, count_mpi_statistics, dbcsr_mm_multrec_type_p, &
       dbcsr_mpi_statistics, enumerate_blk_sizes, huge_norm, local_filter, max_memory, &
@@ -74,6 +75,7 @@ MODULE dbcsr_mm_cannon
                                        dbcsr_reset_vlocals, &
                                        image_calculator
    USE dbcsr_mm_multrec, ONLY: dbcsr_mm_multrec_finalize, &
+                               dbcsr_mm_multrec_finalize_async, &
                                dbcsr_mm_multrec_init, &
                                dbcsr_mm_multrec_multiply
    USE dbcsr_mp_methods, ONLY: &
@@ -850,7 +852,8 @@ CONTAINS
 
    SUBROUTINE multiply_cannon(left_set, right_set, product_matrix, &
                               retain_sparsity, &
-                              filter_eps, flop, keep_product_data)
+                              filter_eps, flop, keep_product_data, &
+                              defer_finalize, multrec_out, async_slot)
       !! Multiplies two DBCSR matrices
 
       TYPE(dbcsr_2d_array_type), POINTER                 :: left_set, right_set
@@ -864,6 +867,16 @@ CONTAINS
       INTEGER(KIND=int_8), INTENT(OUT)                   :: flop
          !! effective flop
       LOGICAL, INTENT(IN)                                :: keep_product_data
+      LOGICAL, INTENT(IN), OPTIONAL                      :: defer_finalize
+         !! if true, start the per-thread finalize asynchronously and return the
+         !! multrec objects for a later dbcsr_mm_multrec_complete() call
+      TYPE(dbcsr_mm_multrec_type_p), DIMENSION(:), ALLOCATABLE, OPTIONAL, &
+         INTENT(OUT)                                     :: multrec_out
+         !! pending multrec objects when defer_finalize is true
+      INTEGER, INTENT(IN), OPTIONAL                      :: async_slot
+         !! retention slot for deferred data areas
+
+      LOGICAL                                            :: defer_fin
 
       CHARACTER(len=*), PARAMETER :: routineN = 'multiply_cannon'
       INTEGER, PARAMETER                                 :: idata = 1, ileft = 0, imeta = 2, &
@@ -924,6 +937,10 @@ CONTAINS
 !   ---------------------------------------------------------------------------
 
       CALL timeset(routineN, handle)
+      defer_fin = .FALSE.
+      IF (PRESENT(defer_finalize)) defer_fin = defer_finalize
+      IF (defer_fin .AND. .NOT. PRESENT(multrec_out)) &
+         DBCSR_ABORT("multiply_cannon: multrec_out required with defer_finalize")
       NULLIFY (trs_stackbuf_calc, trs_stackbuf_comm)
       NULLIFY (row_blk_sizes2enum, enum2row_blk_sizes)
       NULLIFY (col_blk_sizes2enum, enum2col_blk_sizes)
@@ -1668,7 +1685,7 @@ CONTAINS
 !$OMP         keep_sparsity,threads_finished, &
 !$OMP         right_data_sr, right_data_rr, right_index_sr, right_index_rr, &
 !$OMP         left_data_sr, left_data_rr, left_index_sr, left_index_rr, &
-!$OMP         dbcsr_cfg, k_sizes, nvirt_k, metronome) &
+!$OMP         dbcsr_cfg, k_sizes, nvirt_k, metronome, defer_fin) &
 !$OMP PRIVATE (ithread,nthreads,threads_finished_read) &
 !$OMP REDUCTION (+: flop_single)
          ithread = 0; nthreads = 1
@@ -1685,8 +1702,12 @@ CONTAINS
 
          IF (metronome == nvirt_k - 1) THEN
             CALL timeset(routineN//"_multrec_finalize", handle3)
-            CALL dbcsr_mm_multrec_finalize(multrec(ithread)%p)
-            DEALLOCATE (multrec(ithread)%p)
+            IF (defer_fin) THEN
+               CALL dbcsr_mm_multrec_finalize_async(multrec(ithread)%p)
+            ELSE
+               CALL dbcsr_mm_multrec_finalize(multrec(ithread)%p)
+               DEALLOCATE (multrec(ithread)%p)
+            END IF
             CALL timestop(handle3)
          END IF
 
@@ -1726,6 +1747,9 @@ CONTAINS
          END IF
 
       END DO grouped_k_index
+      IF (defer_fin .AND. PRESENT(async_slot)) &
+         CALL dbcsr_data_set_retain_slot(async_slot)
+      IF (defer_fin .AND. ALLOCATED(multrec)) CALL MOVE_ALLOC(multrec, multrec_out)
       CALL timestop(handle1)
       CALL m_memory(mem)
       max_memory = MAX(max_memory, REAL(mem))

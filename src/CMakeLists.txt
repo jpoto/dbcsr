@@ -61,6 +61,7 @@ add_fypp_sources(
   mm/dbcsr_mm_csr.F
   mm/dbcsr_mm_dist_operations.F
   mm/dbcsr_mm.F
+  mm/dbcsr_mm_async.F
   mm/dbcsr_mm_hostdrv.F
   mm/dbcsr_mm_multrec.F
   mm/dbcsr_mm_sched.F

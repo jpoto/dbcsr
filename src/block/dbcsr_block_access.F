@@ -213,6 +213,8 @@ CONTAINS
 
 !   ---------------------------------------------------------------------------
 
+      IF (matrix%async_pending) &
+         DBCSR_ABORT("dbcsr_get_block_p: matrix has a pending asynchronous multiplication")
       IF (careful_mod) CALL timeset(routineN, error_handle)
       CALL dbcsr_get_block_index(matrix, row, col, stored_row, stored_col, &
                                  stored_tr, found, blk, offset)

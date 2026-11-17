@@ -25,7 +25,8 @@ MODULE dbcsr_mm_sched
                                  dbcsr_data_get_size
    USE dbcsr_kinds, ONLY: int_4, int_8, real_8
    USE dbcsr_mm_accdrv, ONLY: &
-      dbcsr_mm_accdrv_barrier, dbcsr_mm_accdrv_dev2host_init, dbcsr_mm_accdrv_finalize, &
+      dbcsr_mm_accdrv_barrier, dbcsr_mm_accdrv_complete, dbcsr_mm_accdrv_dev2host_init, &
+      dbcsr_mm_accdrv_finalize, dbcsr_mm_accdrv_finalize_async, &
       dbcsr_mm_accdrv_init, dbcsr_mm_accdrv_lib_finalize, dbcsr_mm_accdrv_lib_init, &
       dbcsr_mm_accdrv_process, dbcsr_mm_accdrv_type
    USE dbcsr_mm_hostdrv, ONLY: dbcsr_mm_hostdrv_init, &
@@ -60,6 +61,7 @@ MODULE dbcsr_mm_sched
    PUBLIC :: dbcsr_mm_sched_type
    PUBLIC :: dbcsr_mm_sched_lib_init, dbcsr_mm_sched_lib_finalize
    PUBLIC :: dbcsr_mm_sched_init, dbcsr_mm_sched_finalize
+   PUBLIC :: dbcsr_mm_sched_finalize_async, dbcsr_mm_sched_complete
    PUBLIC :: dbcsr_mm_sched_print_statistics
    PUBLIC :: dbcsr_mm_sched_process
    PUBLIC :: dbcsr_mm_sched_begin_burst, dbcsr_mm_sched_end_burst
@@ -76,6 +78,7 @@ MODULE dbcsr_mm_sched
       LOGICAL                         :: avoid_accdrv = .FALSE.
       LOGICAL                         :: product_wm_cleared = .FALSE.
       LOGICAL                         :: keep_product_data = .TRUE.
+      LOGICAL                         :: completion_pending = .FALSE.
       INTEGER                         :: product_wm_orig_datasize = -1
    END TYPE dbcsr_mm_sched_type
 
@@ -184,6 +187,7 @@ CONTAINS
       CALL timeset(routineN, handle)
 
       this%keep_product_data = keep_product_data
+      this%completion_pending = .FALSE.
 
       this%product_wm => product_wm
 
@@ -205,7 +209,17 @@ CONTAINS
       !! Finalizes a multiplication cycle for a set of C-blocks.
       TYPE(dbcsr_mm_sched_type), INTENT(INOUT)           :: this
 
-      CHARACTER(len=*), PARAMETER :: routineN = 'dbcsr_mm_sched_finalize'
+      CALL dbcsr_mm_sched_finalize_async(this)
+      CALL dbcsr_mm_sched_complete(this)
+
+   END SUBROUTINE dbcsr_mm_sched_finalize
+
+   SUBROUTINE dbcsr_mm_sched_finalize_async(this)
+      !! Starts the asynchronous completion of a multiplication cycle.
+      !! Device-to-host copies are enqueued, but not synchronized.
+      TYPE(dbcsr_mm_sched_type), INTENT(INOUT)           :: this
+
+      CHARACTER(len=*), PARAMETER :: routineN = 'dbcsr_mm_sched_finalize_async'
 
       INTEGER                                            :: handle
 
@@ -216,11 +230,35 @@ CONTAINS
 
       !CALL dbcsr_mm_hostdrv_finalize(this%hostdrv) ! not needed
       IF (use_acc()) &
-         CALL dbcsr_mm_accdrv_finalize(this%accdrv)
+         CALL dbcsr_mm_accdrv_finalize_async(this%accdrv)
+
+      this%completion_pending = .TRUE.
 
       CALL timestop(handle)
 
-   END SUBROUTINE dbcsr_mm_sched_finalize
+   END SUBROUTINE dbcsr_mm_sched_finalize_async
+
+   SUBROUTINE dbcsr_mm_sched_complete(this)
+      !! Completes a multiplication cycle started by
+      !! dbcsr_mm_sched_finalize_async().
+      TYPE(dbcsr_mm_sched_type), INTENT(INOUT)           :: this
+
+      CHARACTER(len=*), PARAMETER :: routineN = 'dbcsr_mm_sched_complete'
+
+      INTEGER                                            :: handle
+
+      IF (.NOT. this%completion_pending) RETURN
+
+      CALL timeset(routineN, handle)
+
+      IF (use_acc()) &
+         CALL dbcsr_mm_accdrv_complete(this%accdrv)
+
+      this%completion_pending = .FALSE.
+
+      CALL timestop(handle)
+
+   END SUBROUTINE dbcsr_mm_sched_complete
 
    SUBROUTINE dbcsr_mm_sched_dev2host_init(this)
       !! Finalizes a multiplication cycle for a set of C-blocks.

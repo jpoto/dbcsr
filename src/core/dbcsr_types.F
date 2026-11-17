@@ -371,6 +371,8 @@ MODULE dbcsr_types
          !! a unique number of each created matrix
       LOGICAL                                      :: valid = .FALSE.
          !! whether the matrix is valid (consistent)
+      LOGICAL                                      :: async_pending = .FALSE.
+         !! a deferred (asynchronous) multiplication is writing this product
       CHARACTER(LEN=default_string_length)         :: name = ""
          !! name of the matrix
       TYPE(dbcsr_data_obj)                         :: data_area = dbcsr_data_obj()

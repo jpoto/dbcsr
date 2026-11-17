@@ -13,7 +13,7 @@ MODULE dbcsr_mm
    !! <b>Modification history:</b>
    !! - 2016-08    Code organization (Alfio Lazzaro).
 
-   USE dbcsr_acc_device, ONLY: dbcsr_acc_clear_errors
+   USE dbcsr_acc_device, ONLY: dbcsr_acc_clear_errors, acc_device_synchronize
    USE dbcsr_acc_stream, ONLY: acc_stream_associated, &
                                acc_stream_create, &
                                acc_stream_destroy
@@ -28,6 +28,7 @@ MODULE dbcsr_mm
                            default_resize_factor, &
                            use_acc
    USE dbcsr_data_methods, ONLY: dbcsr_data_set_size_referenced, &
+      dbcsr_data_flush_retained, &
                                  dbcsr_scalar_are_equal, &
                                  dbcsr_scalar_one, &
                                  dbcsr_scalar_zero
@@ -64,10 +65,12 @@ MODULE dbcsr_mm
                               multiply_cannon, &
                               multiply_cannon_g2g
    USE dbcsr_mm_common, ONLY: &
+      dbcsr_mm_multrec_type_p, &
       dbcsr_mpi_statistics, max_memory, memtype_abpanel_1, memtype_abpanel_2, &
       memtype_mpi_buffer, memtype_mpi_product, memtype_product_wm, memtype_trsbuffer_1, &
       memtype_normsbuf, memtype_offsetsbuf, memtype_nelemsbuf, &
       memtype_trsbuffer_2, num_multiplications, stream_1, stream_2
+   USE dbcsr_mm_multrec, ONLY: dbcsr_mm_multrec_complete
    USE dbcsr_mm_dist_operations, ONLY: dbcsr_create_image_dist, &
                                        dbcsr_make_dists_dense, &
                                        dbcsr_reset_locals, &
@@ -120,10 +123,34 @@ MODULE dbcsr_mm
 
    REAL, PRIVATE, SAVE :: marketing_flops = 0
 
+   ! Deferred (Layer A) multiplication contexts. Multiple products can be in
+   ! flight; each occupies one slot until its handle is waited on.
+   INTEGER, PARAMETER, PRIVATE :: max_async_slots = 8
+
+   TYPE async_ctx_type
+      LOGICAL :: active = .FALSE.
+      LOGICAL :: reshuffle = .FALSE.
+      LOGICAL :: product_reindex = .FALSE.
+      LOGICAL :: release_tdist = .FALSE.
+      LOGICAL :: thread_dist_force = .FALSE.
+      TYPE(array_i1d_obj) :: matrix_c_thread_dist
+      TYPE(array_i1d_obj) :: left_thread_dist
+      TYPE(dbcsr_type), POINTER :: product_matrix => Null()
+      TYPE(dbcsr_type), POINTER :: matrix_c => Null()
+      TYPE(dbcsr_mm_multrec_type_p), DIMENSION(:), ALLOCATABLE :: multrec
+   END TYPE async_ctx_type
+
+   TYPE(async_ctx_type), SAVE :: async_ctx(max_async_slots)
+
    PUBLIC :: dbcsr_multiply_lib_init, dbcsr_multiply_lib_finalize
    PUBLIC :: dbcsr_multiply_print_statistics
    PUBLIC :: dbcsr_multiply_clear_mempools
    PUBLIC :: dbcsr_multiply_generic
+   PUBLIC :: dbcsr_multiply_complete_async
+   PUBLIC :: dbcsr_multiply_complete_async_slot
+   PUBLIC :: dbcsr_multiply_async_pending
+   PUBLIC :: dbcsr_multiply_async_slot_alloc
+   PUBLIC :: dbcsr_multiply_async_slot_pending
 
 CONTAINS
 
@@ -165,6 +192,8 @@ CONTAINS
       INTEGER                                            :: error_handle, ithread
 
       CALL timeset(routineN, error_handle)
+
+      IF (dbcsr_multiply_async_pending()) CALL dbcsr_multiply_complete_async()
 
       CALL dbcsr_mm_multrec_lib_finalize()
 
@@ -337,7 +366,7 @@ CONTAINS
                                      alpha, matrix_a, matrix_b, beta, matrix_c, &
                                      first_row, last_row, first_column, last_column, first_k, last_k, &
                                      retain_sparsity, filter_eps, &
-                                     flop)
+                                     flop, defer_completion, async_slot)
       !! Performs a multiplication of two dbcsr_type matrices,
       !! as  C := alpha * op( A ) * op( B ) + beta * C.
       !!
@@ -380,7 +409,7 @@ CONTAINS
          !! right BCSR matrix
       TYPE(dbcsr_scalar_type), INTENT(IN)                :: beta
          !! scaling of existing data
-      TYPE(dbcsr_type), INTENT(INOUT)                    :: matrix_c
+      TYPE(dbcsr_type), INTENT(INOUT), TARGET            :: matrix_c
          !! resulting BCSR product matrix.
       INTEGER, INTENT(IN), OPTIONAL                      :: first_row, last_row, first_column, &
                                                             last_column, first_k, last_k
@@ -396,6 +425,12 @@ CONTAINS
          !! Filtering of the matrix
       INTEGER(KIND=int_8), INTENT(OUT), OPTIONAL         :: flop
          !! effective flop
+      LOGICAL, INTENT(IN), OPTIONAL                      :: defer_completion
+         !! Defer the finalization of the product and return immediately after
+         !! the device work has been enqueued. The caller must invoke
+         !! dbcsr_multiply_complete_async_slot() before using matrix_c.
+      INTEGER, INTENT(IN), OPTIONAL                      :: async_slot
+         !! Slot index in async_ctx where the deferred state is stored.
 
       CHARACTER(len=*), PARAMETER :: routineN = 'dbcsr_multiply_generic'
       LOGICAL, PARAMETER                                 :: dbg = .FALSE.
@@ -408,6 +443,7 @@ CONTAINS
       INTEGER(KIND=int_8)                                :: my_flop
       LOGICAL :: ab_dense, keep_product_data, keep_sparsity, product_reindex, release_tdist, &
                  transpose_left, transpose_right, use_dense_mult, use_mempools, thread_dist_force
+      LOGICAL :: async_here
       REAL(KIND=dp)                                      :: cs
       TYPE(array_i1d_obj) :: dense_col_sizes, dense_k_sizes, dense_row_sizes, k_vmap, m_map, &
                              n_map, old_product_col_blk_offsets, old_product_col_blk_sizes, &
@@ -419,10 +455,14 @@ CONTAINS
       TYPE(dbcsr_imagedistribution_obj)                  :: dense_rdist_left, dense_rdist_right, &
                                                             rdist_left, rdist_right
       TYPE(dbcsr_mp_obj)                                 :: mp_obj
-      TYPE(dbcsr_type)                                   :: matrix_left, matrix_right, product_matrix
+      TYPE(dbcsr_type)                                   :: matrix_left, matrix_right
+      TYPE(dbcsr_type), POINTER                          :: product_matrix => Null()
       TYPE(mp_comm_type)                                 :: comm
 
       CALL timeset(routineN, handle)
+
+      IF (matrix_c%async_pending) &
+         DBCSR_ABORT("dbcsr_multiply_generic: product has a pending asynchronous multiplication")
 
       IF (dbcsr_get_occupation(matrix_a) .GT. 1) &
          DBCSR_ABORT("Matrix A occupation > 1")
@@ -785,6 +825,14 @@ CONTAINS
       !
       IF (use_dense_mult .AND. .NOT. ab_dense) &
          DBCSR_ABORT("Wrong logic when making dense matrices.")
+      async_here = .FALSE.
+      IF (PRESENT(defer_completion)) THEN
+         IF (defer_completion .AND. PRESENT(async_slot) .AND. &
+             async_slot .GE. 1 .AND. async_slot .LE. max_async_slots .AND. &
+             .NOT. dbcsr_cfg%use_mpi_rma%val .AND. &
+             .NOT. dbcsr_cfg%use_acc_g2g%val .AND. .NOT. use_dense_mult) async_here = .TRUE.
+      END IF
+      ALLOCATE (product_matrix)
       IF (use_dense_mult) THEN
          old_product_row_blk_offsets = matrix_c%row_blk_offset
          old_product_col_blk_offsets = matrix_c%col_blk_offset
@@ -910,17 +958,28 @@ CONTAINS
             ! If G2G is enabled, norms have to be calculated on the GPU.
             ! Since the norms kernel expects only real_8 type data, we
             ! avoid using G2G for all other data types
-            CALL multiply_cannon(m2s_left, m2s_right, product_matrix, &
-                                 retain_sparsity=retain_sparsity, &
-                                 filter_eps=filter_eps, &
-                                 flop=my_flop, keep_product_data=keep_product_data)
+            IF (async_here) THEN
+               CALL multiply_cannon(m2s_left, m2s_right, product_matrix, &
+                                    retain_sparsity=retain_sparsity, &
+                                    filter_eps=filter_eps, &
+                                    flop=my_flop, keep_product_data=keep_product_data, &
+                                    defer_finalize=.TRUE., &
+                                    multrec_out=async_ctx(async_slot)%multrec, &
+                                    async_slot=async_slot)
+            ELSE
+               CALL multiply_cannon(m2s_left, m2s_right, product_matrix, &
+                                    retain_sparsity=retain_sparsity, &
+                                    filter_eps=filter_eps, &
+                                    flop=my_flop, keep_product_data=keep_product_data)
+            END IF
          ELSE
             CALL multiply_cannon_g2g(m2s_left, m2s_right, product_matrix, &
                                      retain_sparsity=retain_sparsity, &
                                      filter_eps=filter_eps, &
                                      flop=my_flop, keep_product_data=keep_product_data)
          END IF
-         CALL dbcsr_finalize(product_matrix, reshuffle=PRESENT(filter_eps) .AND. .NOT. keep_sparsity)
+         IF (.NOT. async_here) &
+            CALL dbcsr_finalize(product_matrix, reshuffle=PRESENT(filter_eps) .AND. .NOT. keep_sparsity)
       END IF
       !
       ! RMA implementation algorithm has to synchronize at the end of each multiplication
@@ -939,15 +998,53 @@ CONTAINS
          CALL mp_isync(comm, request_sync_mult)
       END IF
       !
-      IF (release_tdist) THEN
-         CALL dbcsr_distribution_no_threads(product_matrix%dist)
-      ELSEIF (thread_dist_force) THEN
-         ! Restore matrix_c thread-dist
-         matrix_c%dist%d%thread_dist = matrix_c_thread_dist
-         CALL array_release(matrix_left%dist%d%thread_dist)
+      IF (.NOT. async_here) THEN
+         IF (release_tdist) THEN
+            CALL dbcsr_distribution_no_threads(product_matrix%dist)
+         ELSEIF (thread_dist_force) THEN
+            ! Restore matrix_c thread-dist
+            matrix_c%dist%d%thread_dist = matrix_c_thread_dist
+            CALL array_release(matrix_left%dist%d%thread_dist)
+         END IF
+      ELSE
+         ! Capture the extra hold on the forced thread distribution before the
+         ! transposed operands are released. Restoring is deferred.
+         async_ctx(async_slot)%release_tdist = release_tdist
+         async_ctx(async_slot)%thread_dist_force = thread_dist_force
+         IF (thread_dist_force) THEN
+            async_ctx(async_slot)%matrix_c_thread_dist = matrix_c_thread_dist
+            async_ctx(async_slot)%left_thread_dist = matrix_left%dist%d%thread_dist
+            CALL array_hold(async_ctx(async_slot)%left_thread_dist)
+         END IF
       END IF
       IF (transpose_left) CALL dbcsr_release(matrix_left)
       IF (transpose_right) CALL dbcsr_release(matrix_right)
+      !
+      IF (async_here) THEN
+         ! Launch-safe cleanup. Product-dependent work is deferred to
+         ! dbcsr_multiply_complete_async().
+         IF (.NOT. dbcsr_cfg%use_mpi_rma%val) THEN
+            CALL dbcsr_destroy_array(m2s_left)
+            DEALLOCATE (m2s_left)
+            CALL dbcsr_destroy_array(m2s_right)
+            DEALLOCATE (m2s_right)
+         END IF
+         CALL dbcsr_image_dist_release(rdist_left)
+         CALL dbcsr_image_dist_release(rdist_right)
+         IF (ab_dense) THEN
+            CALL array_release(m_map)
+            CALL array_release(n_map)
+         END IF
+         async_ctx(async_slot)%product_matrix => product_matrix
+         async_ctx(async_slot)%matrix_c => matrix_c
+         async_ctx(async_slot)%reshuffle = PRESENT(filter_eps) .AND. .NOT. keep_sparsity
+         async_ctx(async_slot)%product_reindex = product_reindex
+         matrix_c%async_pending = .TRUE.
+         async_ctx(async_slot)%active = .TRUE.
+         num_multiplications = num_multiplications + 1
+         CALL timestop(handle)
+         RETURN
+      END IF
       !
       CALL dbcsr_release_locals(product_matrix)
       ! The index of the product matrix is reset to the CP2K form if it
@@ -1021,6 +1118,122 @@ CONTAINS
       num_multiplications = num_multiplications + 1
       CALL timestop(handle)
    END SUBROUTINE dbcsr_multiply_generic
+
+   FUNCTION dbcsr_multiply_async_slot_alloc() RESULT(slot)
+      !! Returns a free deferred-multiplication slot, or -1 if none is free.
+      INTEGER                                            :: slot, i
+
+      slot = -1
+      DO i = 1, max_async_slots
+         IF (.NOT. async_ctx(i)%active) THEN
+            IF (ALLOCATED(async_ctx(i)%multrec)) DEALLOCATE (async_ctx(i)%multrec)
+            async_ctx(i)%reshuffle = .FALSE.
+            async_ctx(i)%product_reindex = .FALSE.
+            async_ctx(i)%release_tdist = .FALSE.
+            async_ctx(i)%thread_dist_force = .FALSE.
+            slot = i
+            RETURN
+         END IF
+      END DO
+      DBCSR_ABORT("dbcsr_multiply_async_slot_alloc: no free async slot")
+   END FUNCTION dbcsr_multiply_async_slot_alloc
+
+   FUNCTION dbcsr_multiply_async_slot_pending(slot) RESULT(pending)
+      !! Returns whether the given deferred multiplication is still pending.
+      INTEGER, INTENT(IN)                                :: slot
+      LOGICAL                                            :: pending
+
+      pending = (slot .GE. 1 .AND. slot .LE. max_async_slots) .AND. async_ctx(slot)%active
+   END FUNCTION dbcsr_multiply_async_slot_pending
+
+   FUNCTION dbcsr_multiply_async_pending() RESULT(pending)
+      !! Returns whether any deferred multiplication is still pending.
+      LOGICAL                                            :: pending
+      INTEGER                                            :: i
+
+      pending = .FALSE.
+      DO i = 1, max_async_slots
+         IF (async_ctx(i)%active) pending = .TRUE.
+      END DO
+   END FUNCTION dbcsr_multiply_async_pending
+
+   SUBROUTINE dbcsr_multiply_complete_async_slot(slot)
+      !! Completes a multiplication started with defer_completion=.TRUE.
+      INTEGER, INTENT(IN)                                :: slot
+
+      CHARACTER(len=*), PARAMETER :: routineN = 'dbcsr_multiply_complete_async_slot'
+
+      INTEGER                                            :: handle, i, ithread, nthreads
+
+      IF (slot .LT. 1 .OR. slot .GT. max_async_slots) RETURN
+      IF (.NOT. async_ctx(slot)%active) RETURN
+
+      CALL timeset(routineN, handle)
+      IF (ASSOCIATED(async_ctx(slot)%matrix_c)) &
+         async_ctx(slot)%matrix_c%async_pending = .FALSE.
+      !
+      ! Complete all per-thread multrec objects. The accelerator stream of each
+      ! multrec should be synchronized on the OpenMP thread that created it, so
+      ! re-enter a parallel region with the same number of threads. The serial
+      ! fallback below is idempotent and covers the case where fewer threads are
+      ! available at completion time.
+      IF (ALLOCATED(async_ctx(slot)%multrec)) THEN
+         nthreads = SIZE(async_ctx(slot)%multrec)
+!$OMP PARALLEL DEFAULT(NONE) SHARED(async_ctx, slot) PRIVATE(ithread) NUM_THREADS(nthreads)
+         ithread = 0
+!$       ithread = omp_get_thread_num()
+         IF (ithread .LE. UBOUND(async_ctx(slot)%multrec, 1)) THEN
+            IF (ASSOCIATED(async_ctx(slot)%multrec(ithread)%p)) &
+               CALL dbcsr_mm_multrec_complete(async_ctx(slot)%multrec(ithread)%p)
+         END IF
+!$OMP END PARALLEL
+         DO i = LBOUND(async_ctx(slot)%multrec, 1), UBOUND(async_ctx(slot)%multrec, 1)
+            IF (ASSOCIATED(async_ctx(slot)%multrec(i)%p)) THEN
+               CALL dbcsr_mm_multrec_complete(async_ctx(slot)%multrec(i)%p)
+               DEALLOCATE (async_ctx(slot)%multrec(i)%p)
+            END IF
+         END DO
+         DEALLOCATE (async_ctx(slot)%multrec)
+      END IF
+      !
+      ! All accelerator work for this slot is now complete. Release the data
+      ! areas that were kept alive during the launch window.
+      CALL dbcsr_data_flush_retained(slot)
+      !
+      ! Restore the thread distribution (same order as the synchronous tail).
+      IF (async_ctx(slot)%release_tdist) THEN
+         CALL dbcsr_distribution_no_threads(async_ctx(slot)%product_matrix%dist)
+      ELSEIF (async_ctx(slot)%thread_dist_force) THEN
+         async_ctx(slot)%matrix_c%dist%d%thread_dist = async_ctx(slot)%matrix_c_thread_dist
+         CALL array_release(async_ctx(slot)%left_thread_dist)
+      END IF
+      !
+      CALL dbcsr_finalize(async_ctx(slot)%product_matrix, reshuffle=async_ctx(slot)%reshuffle)
+      CALL dbcsr_release_locals(async_ctx(slot)%product_matrix)
+      IF (async_ctx(slot)%product_reindex) &
+         CALL dbcsr_make_index_canonical(async_ctx(slot)%product_matrix, cp2k=.TRUE.)
+      !
+      CALL dbcsr_release(async_ctx(slot)%matrix_c)
+      async_ctx(slot)%matrix_c = dbcsr_type()
+      CALL dbcsr_copy(async_ctx(slot)%matrix_c, async_ctx(slot)%product_matrix, shallow_data=.TRUE.)
+      CALL dbcsr_release(async_ctx(slot)%product_matrix)
+      DEALLOCATE (async_ctx(slot)%product_matrix)
+      NULLIFY (async_ctx(slot)%product_matrix)
+      CALL dbcsr_make_untransposed_blocks(async_ctx(slot)%matrix_c)
+      NULLIFY (async_ctx(slot)%matrix_c)
+      !
+      async_ctx(slot)%active = .FALSE.
+      CALL timestop(handle)
+   END SUBROUTINE dbcsr_multiply_complete_async_slot
+
+   SUBROUTINE dbcsr_multiply_complete_async()
+      !! Completes all pending deferred multiplications.
+      INTEGER                                            :: i
+
+      DO i = 1, max_async_slots
+         IF (async_ctx(i)%active) CALL dbcsr_multiply_complete_async_slot(i)
+      END DO
+   END SUBROUTINE dbcsr_multiply_complete_async
 
    SUBROUTINE check_openmpi_rma()
       ! Check if RMA is used with OpenMPI, if so disabled it

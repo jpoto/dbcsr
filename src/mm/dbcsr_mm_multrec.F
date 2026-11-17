@@ -29,7 +29,8 @@ MODULE dbcsr_mm_multrec
                                  dbcsr_distribution_row_dist, &
                                  dbcsr_distribution_thread_dist
    USE dbcsr_mm_csr, ONLY: &
-      dbcsr_mm_csr_dev2host_init, dbcsr_mm_csr_finalize, dbcsr_mm_csr_init, &
+      dbcsr_mm_csr_complete, dbcsr_mm_csr_dev2host_init, dbcsr_mm_csr_finalize, &
+      dbcsr_mm_csr_finalize_async, dbcsr_mm_csr_init, &
       dbcsr_mm_csr_lib_finalize, dbcsr_mm_csr_lib_init, dbcsr_mm_csr_multiply, &
       dbcsr_mm_csr_purge_stacks, dbcsr_mm_csr_red3D, dbcsr_mm_csr_type
    USE dbcsr_types, ONLY: dbcsr_data_obj, &
@@ -87,12 +88,14 @@ MODULE dbcsr_mm_multrec
       TYPE(dbcsr_mm_csr_type)        :: csr = dbcsr_mm_csr_type()
       LOGICAL                        :: new_row_max_epss = .FALSE.
       LOGICAL                        :: initialized = .FALSE.
+      LOGICAL                        :: completion_pending = .FALSE.
    END TYPE dbcsr_mm_multrec_type
 
    ! **************************************************************************************************
    PUBLIC :: dbcsr_mm_multrec_type
    PUBLIC :: dbcsr_mm_multrec_lib_init, dbcsr_mm_multrec_lib_finalize
    PUBLIC :: dbcsr_mm_multrec_init, dbcsr_mm_multrec_finalize
+   PUBLIC :: dbcsr_mm_multrec_finalize_async, dbcsr_mm_multrec_complete
    PUBLIC :: dbcsr_mm_multrec_multiply
    PUBLIC :: dbcsr_mm_multrec_dev2host_init, dbcsr_mm_multrec_red3D
    PUBLIC :: dbcsr_mm_multrec_get_nblks, dbcsr_mm_multrec_get_nze
@@ -257,6 +260,7 @@ CONTAINS
                              keep_product_data=this%keep_product_data)
 
       this%initialized = .TRUE.
+      this%completion_pending = .FALSE.
       CALL timestop(handle)
    END SUBROUTINE dbcsr_mm_multrec_init
 
@@ -339,18 +343,49 @@ CONTAINS
       TYPE(dbcsr_mm_multrec_type), INTENT(inout)         :: this
       INTEGER, DIMENSION(:), INTENT(INOUT), OPTIONAL     :: meta_buffer
 
-      CHARACTER(len=*), PARAMETER :: routineN = 'dbcsr_mm_multrec_finalize'
+      CALL dbcsr_mm_multrec_finalize_async(this)
+      CALL dbcsr_mm_multrec_complete(this, meta_buffer)
+
+   END SUBROUTINE dbcsr_mm_multrec_finalize
+
+   SUBROUTINE dbcsr_mm_multrec_finalize_async(this)
+      !! Starts the asynchronous completion of a recursive multiplication.
+      TYPE(dbcsr_mm_multrec_type), INTENT(inout)         :: this
+
+      CHARACTER(len=*), PARAMETER :: routineN = 'dbcsr_mm_multrec_finalize_async'
+
+      INTEGER                                            :: handle
+
+      CALL timeset(routineN, handle)
+      IF (.NOT. this%initialized) &
+         DBCSR_ABORT("multrec not initialized.")
+      IF (this%completion_pending) &
+         DBCSR_ABORT("multrec completion already pending.")
+
+      CALL dbcsr_mm_csr_finalize_async(this%csr)
+      this%completion_pending = .TRUE.
+      CALL timestop(handle)
+
+   END SUBROUTINE dbcsr_mm_multrec_finalize_async
+
+   SUBROUTINE dbcsr_mm_multrec_complete(this, meta_buffer)
+      !! Completes a recursive multiplication started by
+      !! dbcsr_mm_multrec_finalize_async().
+      TYPE(dbcsr_mm_multrec_type), INTENT(inout)         :: this
+      INTEGER, DIMENSION(:), INTENT(INOUT), OPTIONAL     :: meta_buffer
+
+      CHARACTER(len=*), PARAMETER :: routineN = 'dbcsr_mm_multrec_complete'
 
       INTEGER                                            :: handle, ithread, lb_meta, &
                                                             nblocks, nthreads, ub_meta
 
 !   ---------------------------------------------------------------------------
 
-      CALL timeset(routineN, handle)
-      IF (.NOT. this%initialized) &
-         DBCSR_ABORT("multrec not initialized.")
+      IF (.NOT. this%completion_pending) RETURN
 
-      CALL dbcsr_mm_csr_finalize(this%csr)
+      CALL timeset(routineN, handle)
+
+      CALL dbcsr_mm_csr_complete(this%csr)
 
       ! Release the carrier
       IF (this%new_row_max_epss) DEALLOCATE (this%row_max_epss)
@@ -384,8 +419,9 @@ CONTAINS
       END IF
 
       this%initialized = .FALSE.
+      this%completion_pending = .FALSE.
       CALL timestop(handle)
-   END SUBROUTINE dbcsr_mm_multrec_finalize
+   END SUBROUTINE dbcsr_mm_multrec_complete
 
    SUBROUTINE multrec_filtering(this)
       !! Applying in-place filtering on the workspace

@@ -83,6 +83,7 @@ MODULE dbcsr_mm_accdrv
       LOGICAL                                  :: c_area_copy = .TRUE.
       LOGICAL                                  :: keep_product_data = .TRUE.
       LOGICAL                                  :: do_gpu_c_redux = .FALSE.
+      LOGICAL                                  :: completion_pending = .FALSE.
       INTEGER                                  :: nlayers = 1
    END TYPE dbcsr_mm_accdrv_type
 
@@ -92,6 +93,7 @@ MODULE dbcsr_mm_accdrv
    PUBLIC :: dbcsr_mm_accdrv_lib_init, dbcsr_mm_accdrv_lib_finalize
    PUBLIC :: dbcsr_mm_accdrv_barrier
    PUBLIC :: dbcsr_mm_accdrv_init, dbcsr_mm_accdrv_finalize
+   PUBLIC :: dbcsr_mm_accdrv_finalize_async, dbcsr_mm_accdrv_complete
    PUBLIC :: dbcsr_mm_accdrv_process
    PUBLIC :: dbcsr_mm_accdrv_dev2host_init
 
@@ -203,6 +205,8 @@ CONTAINS
       !------------------------------------------------------------------------
       this%keep_product_data = keep_product_data
       this%do_gpu_c_redux = .FALSE.
+      this%completion_pending = .FALSE.
+      this%c_area_copy = .TRUE.
       this%product_wm => product_wm
       c_area = this%product_wm%data_area
 
@@ -341,13 +345,39 @@ CONTAINS
       !! Finalizes a multiplication cycle for a set of C-blocks.
       TYPE(dbcsr_mm_accdrv_type), INTENT(INOUT)          :: this
 
-      TYPE(dbcsr_data_obj)                               :: c_area
+      CALL dbcsr_mm_accdrv_finalize_async(this)
+      CALL dbcsr_mm_accdrv_complete(this)
+
+   END SUBROUTINE dbcsr_mm_accdrv_finalize
+
+   SUBROUTINE dbcsr_mm_accdrv_finalize_async(this)
+      !! Starts the asynchronous completion of a multiplication cycle.
+      !! The device-to-host copy is enqueued on the accelerator stream, but
+      !! the stream is not synchronized and the result is not merged into the
+      !! host work matrix.  A matching call to dbcsr_mm_accdrv_complete() is
+      !! required before the product can be used.
+      TYPE(dbcsr_mm_accdrv_type), INTENT(INOUT)          :: this
 
 ! Transfer C-data from device to host and adding it to host's result
 
       IF (this%c_area_copy) THEN
          CALL dbcsr_data_dev2host(this%c_buffer)
+         this%c_area_copy = .FALSE.
       END IF
+      this%completion_pending = .TRUE.
+
+   END SUBROUTINE dbcsr_mm_accdrv_finalize_async
+
+   SUBROUTINE dbcsr_mm_accdrv_complete(this)
+      !! Completes a multiplication cycle started by
+      !! dbcsr_mm_accdrv_finalize_async().  Waits for the accelerator stream
+      !! and merges the product into the host work matrix.
+      TYPE(dbcsr_mm_accdrv_type), INTENT(INOUT)          :: this
+
+      TYPE(dbcsr_data_obj)                               :: c_area
+
+      IF (.NOT. this%completion_pending) RETURN
+
       CALL acc_stream_synchronize(this%c_buffer%d%memory_type%acc_stream)
 
       c_area = this%product_wm%data_area
@@ -358,8 +388,9 @@ CONTAINS
          CALL dbcsr_data_release(this%product_wm%data_area)
          this%product_wm%data_area = this%c_buffer
       END IF
+      this%completion_pending = .FALSE.
 
-   END SUBROUTINE dbcsr_mm_accdrv_finalize
+   END SUBROUTINE dbcsr_mm_accdrv_complete
 
    SUBROUTINE stack_sort(params_in, params_out, stack_size)
       !! Sort stack entries with respect to the c_id.

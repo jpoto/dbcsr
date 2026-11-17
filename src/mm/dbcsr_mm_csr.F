@@ -31,8 +31,9 @@ MODULE dbcsr_mm_csr
                           int_8, &
                           sp
    USE dbcsr_mm_sched, ONLY: &
-      dbcsr_mm_sched_barrier, dbcsr_mm_sched_begin_burst, dbcsr_mm_sched_dev2host_init, &
-      dbcsr_mm_sched_end_burst, dbcsr_mm_sched_finalize, dbcsr_mm_sched_init, &
+      dbcsr_mm_sched_barrier, dbcsr_mm_sched_begin_burst, dbcsr_mm_sched_complete, &
+      dbcsr_mm_sched_dev2host_init, dbcsr_mm_sched_end_burst, dbcsr_mm_sched_finalize, &
+      dbcsr_mm_sched_finalize_async, dbcsr_mm_sched_init, &
       dbcsr_mm_sched_lib_finalize, dbcsr_mm_sched_lib_init, &
       dbcsr_mm_sched_process, dbcsr_mm_sched_set_orig_datasize, dbcsr_mm_sched_type
    USE dbcsr_mm_types, ONLY: &
@@ -77,6 +78,7 @@ MODULE dbcsr_mm_csr
       INTEGER, DIMENSION(:), POINTER           :: stacks_fillcount => Null()
       TYPE(dbcsr_mm_sched_type)                      :: sched = dbcsr_mm_sched_type()
       LOGICAL                                  :: keep_product_data = .FALSE.
+      LOGICAL                                  :: completion_pending = .FALSE.
    END TYPE dbcsr_mm_csr_type
 
 #include "utils/dbcsr_hash_table_types.f90"
@@ -85,6 +87,7 @@ MODULE dbcsr_mm_csr
    PUBLIC :: dbcsr_mm_csr_type
    PUBLIC :: dbcsr_mm_csr_lib_init, dbcsr_mm_csr_lib_finalize
    PUBLIC :: dbcsr_mm_csr_init, dbcsr_mm_csr_finalize
+   PUBLIC :: dbcsr_mm_csr_finalize_async, dbcsr_mm_csr_complete
    PUBLIC :: dbcsr_mm_csr_multiply, dbcsr_mm_csr_purge_stacks
    PUBLIC :: dbcsr_mm_csr_dev2host_init, dbcsr_mm_csr_red3D
 
@@ -526,6 +529,7 @@ CONTAINS
       DEALLOCATE (flop_list, flop_index, tmp_descr)
 
       this%keep_product_data = keep_product_data
+      this%completion_pending = .FALSE.
 
       this%product_wm => product%wms(ithread + 1)
       CALL dbcsr_mm_sched_init(this%sched, &
@@ -579,9 +583,30 @@ CONTAINS
       !! Finalizes a multiplication cycle for a set of C-blocks.
       TYPE(dbcsr_mm_csr_type), INTENT(INOUT)             :: this
 
+      CALL dbcsr_mm_csr_finalize_async(this)
+      CALL dbcsr_mm_csr_complete(this)
+
+   END SUBROUTINE dbcsr_mm_csr_finalize
+
+   SUBROUTINE dbcsr_mm_csr_finalize_async(this)
+      !! Starts the asynchronous completion of a multiplication cycle.
+      TYPE(dbcsr_mm_csr_type), INTENT(INOUT)             :: this
+
+      CALL dbcsr_mm_sched_finalize_async(this%sched)
+      this%completion_pending = .TRUE.
+
+   END SUBROUTINE dbcsr_mm_csr_finalize_async
+
+   SUBROUTINE dbcsr_mm_csr_complete(this)
+      !! Completes a multiplication cycle started by
+      !! dbcsr_mm_csr_finalize_async().
+      TYPE(dbcsr_mm_csr_type), INTENT(INOUT)             :: this
+
       INTEGER                                            :: i
 
-      CALL dbcsr_mm_sched_finalize(this%sched)
+      IF (.NOT. this%completion_pending) RETURN
+
+      CALL dbcsr_mm_sched_complete(this%sched)
 
       ! Clear hash tables
       DO i = 1, SIZE(this%c_hashes)
@@ -595,7 +620,8 @@ CONTAINS
       DEALLOCATE (this%k_size_maps)
       DEALLOCATE (this%stacks_fillcount)
       DEALLOCATE (this%stacks_data)
-   END SUBROUTINE dbcsr_mm_csr_finalize
+      this%completion_pending = .FALSE.
+   END SUBROUTINE dbcsr_mm_csr_complete
 
    SUBROUTINE dbcsr_mm_csr_dev2host_init(this)
       TYPE(dbcsr_mm_csr_type), INTENT(INOUT)             :: this
