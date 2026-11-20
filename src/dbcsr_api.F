@@ -136,9 +136,25 @@ MODULE dbcsr_api
                                     dbcsr_work_create_prv => dbcsr_work_create
    USE dbcsr_kinds, ONLY: default_string_length, &
                           dp, &
+                          int_4, &
                           int_8, &
                           real_4, &
                           real_8
+   USE ISO_C_BINDING, ONLY: C_F_POINTER, C_INT, C_LOC, C_NULL_PTR, C_PTR
+   USE dbcsr_acc_stream, ONLY: acc_stream_type, &
+                               acc_stream_create, &
+                               acc_stream_destroy, &
+                               acc_stream_synchronize
+   USE dbcsr_acc_hostmem, ONLY: acc_hostmem_allocate, &
+                                acc_hostmem_deallocate
+   USE dbcsr_acc_devmem, ONLY: acc_devmem_type, &
+                               acc_devmem_allocate_bytes, &
+                               acc_devmem_deallocate, &
+                               acc_devmem_allocated, &
+                               acc_devmem_size_in_bytes, &
+                               acc_devmem_host2dev, &
+                               acc_devmem_dev2host, &
+                               acc_devmem_cptr
 
 #include "base/dbcsr_base_uses.f90"
 
@@ -176,6 +192,25 @@ MODULE dbcsr_api
    PUBLIC :: dbcsr_reset_randmat_seed
    PUBLIC :: dbcsr_mp_grid_setup
    PUBLIC :: dbcsr_print_statistics
+
+   ! accelerator (GPU) host-pinned staging memory
+   PUBLIC :: dbcsr_acc_hostmem_alloc_r8_1d
+   PUBLIC :: dbcsr_acc_hostmem_dealloc_r8_1d
+   PUBLIC :: dbcsr_acc_hostmem_alloc_r8_2d
+   PUBLIC :: dbcsr_acc_hostmem_dealloc_r8_2d
+   PUBLIC :: dbcsr_acc_hostmem_available
+
+   ! persistent accelerator (GPU) device buffer
+   PUBLIC :: dbcsr_acc_device_buffer_type
+   PUBLIC :: dbcsr_acc_device_buffer_init
+   PUBLIC :: dbcsr_acc_device_buffer_finalize
+   PUBLIC :: dbcsr_acc_device_buffer_ptr
+   PUBLIC :: dbcsr_acc_device_buffer_size
+   PUBLIC :: dbcsr_acc_device_buffer_sync
+   PUBLIC :: dbcsr_acc_device_buffer_h2d_r8_1d
+   PUBLIC :: dbcsr_acc_device_buffer_d2h_r8_1d
+   PUBLIC :: dbcsr_acc_device_buffer_h2d_r8_2d
+   PUBLIC :: dbcsr_acc_device_buffer_d2h_r8_2d
 
    ! create / release
    PUBLIC :: dbcsr_distribution_hold
@@ -422,6 +457,22 @@ MODULE dbcsr_api
       MODULE PROCEDURE dbcsr_norm_scalar
       MODULE PROCEDURE dbcsr_norm_r8_vec
    END INTERFACE dbcsr_norm
+
+#if defined (__DBCSR_ACC)
+   !> Stream shared by all host-pinned staging buffers handed out through this API.
+   TYPE(acc_stream_type), SAVE :: dbcsr_acc_pinned_stream
+   LOGICAL, SAVE :: dbcsr_acc_pinned_stream_ready = .FALSE.
+#endif
+
+   !> Persistent device buffer with its own stream. Intended to keep a dense matrix (e.g. a
+   !! gathered density or Fock matrix) resident on the accelerator across calls.
+   TYPE :: dbcsr_acc_device_buffer_type
+      PRIVATE
+      TYPE(acc_devmem_type) :: devmem
+      TYPE(acc_stream_type) :: stream
+      INTEGER(KIND=int_8)   :: nbytes = 0
+      LOGICAL               :: initialized = .FALSE.
+   END TYPE dbcsr_acc_device_buffer_type
 
    PRIVATE
 
@@ -1503,5 +1554,278 @@ CONTAINS
          DATA => dbcsr_get_data_p_prv(matrix%prv%data_area, select_data_type, lb, ub)
       END FUNCTION dbcsr_get_data_${nametype1}$
    #:endfor
+
+! **************************************************************************************************
+!> \brief Whether the library was built with accelerator support. Host-pinned staging through this
+!>        API falls back to ordinary pageable memory when accelerator support is unavailable.
+! **************************************************************************************************
+   PURE FUNCTION dbcsr_acc_hostmem_available() RESULT(res)
+      LOGICAL                                            :: res
+
+#if defined (__DBCSR_ACC)
+      res = .TRUE.
+#else
+      res = .FALSE.
+#endif
+   END FUNCTION dbcsr_acc_hostmem_available
+
+#if defined (__DBCSR_ACC)
+! **************************************************************************************************
+!> \brief Lazily creates the stream shared by all pinned staging buffers.
+! **************************************************************************************************
+   SUBROUTINE dbcsr_acc_ensure_pinned_stream()
+
+      IF (.NOT. dbcsr_acc_pinned_stream_ready) THEN
+!$OMP CRITICAL (dbcsr_acc_pinned_stream_crit)
+         IF (.NOT. dbcsr_acc_pinned_stream_ready) THEN
+            CALL acc_stream_create(dbcsr_acc_pinned_stream, "dbcsr pinned host")
+            dbcsr_acc_pinned_stream_ready = .TRUE.
+         END IF
+!$OMP END CRITICAL (dbcsr_acc_pinned_stream_crit)
+      END IF
+   END SUBROUTINE dbcsr_acc_ensure_pinned_stream
+#endif
+
+! **************************************************************************************************
+!> \brief Allocates a 1D real(8) array as accelerator host-pinned (page-locked) memory.
+!> \param[out] host  pointer to the allocated array
+!> \param[in]  n     number of elements
+! **************************************************************************************************
+   SUBROUTINE dbcsr_acc_hostmem_alloc_r8_1d(host, n)
+      REAL(KIND=real_8), DIMENSION(:), POINTER          :: host
+      INTEGER, INTENT(IN)                                :: n
+
+      NULLIFY (host)
+      IF (n <= 0) RETURN
+#if defined (__DBCSR_ACC)
+      CALL dbcsr_acc_ensure_pinned_stream()
+      CALL acc_hostmem_allocate(host, n, dbcsr_acc_pinned_stream)
+#else
+      ALLOCATE (host(n))
+#endif
+   END SUBROUTINE dbcsr_acc_hostmem_alloc_r8_1d
+
+! **************************************************************************************************
+!> \brief Releases memory obtained from dbcsr_acc_hostmem_alloc_r8_1d.
+!> \param[in,out] host  pointer to the array, nullified on return
+! **************************************************************************************************
+   SUBROUTINE dbcsr_acc_hostmem_dealloc_r8_1d(host)
+      REAL(KIND=real_8), DIMENSION(:), POINTER          :: host
+
+      IF (.NOT. ASSOCIATED(host)) RETURN
+      IF (SIZE(host) == 0) THEN
+         NULLIFY (host)
+         RETURN
+      END IF
+#if defined (__DBCSR_ACC)
+      CALL dbcsr_acc_ensure_pinned_stream()
+      CALL acc_hostmem_deallocate(host, dbcsr_acc_pinned_stream)
+#else
+      DEALLOCATE (host)
+#endif
+      NULLIFY (host)
+   END SUBROUTINE dbcsr_acc_hostmem_dealloc_r8_1d
+
+! **************************************************************************************************
+!> \brief Allocates a 2D real(8) array as accelerator host-pinned (page-locked) memory.
+!> \param[out] host  pointer to the allocated array
+!> \param[in]  n1    first dimension
+!> \param[in]  n2    second dimension
+! **************************************************************************************************
+   SUBROUTINE dbcsr_acc_hostmem_alloc_r8_2d(host, n1, n2)
+      REAL(KIND=real_8), DIMENSION(:, :), POINTER      :: host
+      INTEGER, INTENT(IN)                                :: n1, n2
+
+      NULLIFY (host)
+      IF (n1 <= 0 .OR. n2 <= 0) RETURN
+#if defined (__DBCSR_ACC)
+      CALL dbcsr_acc_ensure_pinned_stream()
+      CALL acc_hostmem_allocate(host, n1, n2, dbcsr_acc_pinned_stream)
+#else
+      ALLOCATE (host(n1, n2))
+#endif
+   END SUBROUTINE dbcsr_acc_hostmem_alloc_r8_2d
+
+! **************************************************************************************************
+!> \brief Releases memory obtained from dbcsr_acc_hostmem_alloc_r8_2d.
+!> \param[in,out] host  pointer to the array, nullified on return
+! **************************************************************************************************
+   SUBROUTINE dbcsr_acc_hostmem_dealloc_r8_2d(host)
+      REAL(KIND=real_8), DIMENSION(:, :), POINTER      :: host
+
+      IF (.NOT. ASSOCIATED(host)) RETURN
+      IF (SIZE(host) == 0) THEN
+         NULLIFY (host)
+         RETURN
+      END IF
+#if defined (__DBCSR_ACC)
+      CALL dbcsr_acc_ensure_pinned_stream()
+      CALL acc_hostmem_deallocate(host, dbcsr_acc_pinned_stream)
+#else
+      DEALLOCATE (host)
+#endif
+      NULLIFY (host)
+   END SUBROUTINE dbcsr_acc_hostmem_dealloc_r8_2d
+
+! **************************************************************************************************
+!> \brief Initializes a persistent device buffer of nbytes bytes with its own stream.
+! **************************************************************************************************
+   SUBROUTINE dbcsr_acc_device_buffer_init(this, nbytes, name)
+      TYPE(dbcsr_acc_device_buffer_type), INTENT(INOUT) :: this
+      INTEGER(KIND=int_8), INTENT(IN)                    :: nbytes
+      CHARACTER(len=*), INTENT(IN), OPTIONAL             :: name
+
+      CHARACTER(len=64)                                  :: sname
+
+      CALL dbcsr_acc_device_buffer_finalize(this)
+      IF (nbytes <= 0) RETURN
+      sname = "dbcsr_acc_device_buffer"
+      IF (PRESENT(name)) sname = name
+#if defined (__DBCSR_ACC)
+      IF (nbytes > INT(HUGE(1_int_4), KIND=int_8)) &
+         DBCSR_ABORT("dbcsr_acc_device_buffer_init: buffer too large for int_4 byte count")
+      CALL acc_stream_create(this%stream, TRIM(sname))
+      CALL acc_devmem_allocate_bytes(this%devmem, INT(nbytes, KIND=int_4))
+      this%nbytes = nbytes
+      this%initialized = .TRUE.
+#else
+      MARK_USED(sname)
+      DBCSR_ABORT("dbcsr_acc_device_buffer_init: accelerator support not compiled in.")
+#endif
+   END SUBROUTINE dbcsr_acc_device_buffer_init
+
+! **************************************************************************************************
+!> \brief Releases a persistent device buffer and its stream.
+! **************************************************************************************************
+   SUBROUTINE dbcsr_acc_device_buffer_finalize(this)
+      TYPE(dbcsr_acc_device_buffer_type), INTENT(INOUT) :: this
+
+      IF (.NOT. this%initialized) RETURN
+#if defined (__DBCSR_ACC)
+      CALL acc_stream_synchronize(this%stream)
+      CALL acc_devmem_deallocate(this%devmem)
+      CALL acc_stream_destroy(this%stream)
+#endif
+      this%nbytes = 0
+      this%initialized = .FALSE.
+   END SUBROUTINE dbcsr_acc_device_buffer_finalize
+
+! **************************************************************************************************
+!> \brief Returns the raw device pointer of a persistent device buffer.
+! **************************************************************************************************
+   FUNCTION dbcsr_acc_device_buffer_ptr(this) RESULT(ptr)
+      TYPE(dbcsr_acc_device_buffer_type), INTENT(IN)    :: this
+      TYPE(C_PTR)                                        :: ptr
+
+#if defined (__DBCSR_ACC)
+      IF (.NOT. this%initialized) THEN
+         ptr = C_NULL_PTR
+      ELSE
+         ptr = acc_devmem_cptr(this%devmem)
+      END IF
+#else
+      MARK_USED(this)
+      ptr = C_NULL_PTR
+#endif
+   END FUNCTION dbcsr_acc_device_buffer_ptr
+
+! **************************************************************************************************
+!> \brief Returns the size of a persistent device buffer in bytes.
+! **************************************************************************************************
+   FUNCTION dbcsr_acc_device_buffer_size(this) RESULT(nbytes)
+      TYPE(dbcsr_acc_device_buffer_type), INTENT(IN)    :: this
+      INTEGER(KIND=int_8)                                :: nbytes
+
+      nbytes = this%nbytes
+   END FUNCTION dbcsr_acc_device_buffer_size
+
+! **************************************************************************************************
+!> \brief Synchronizes the stream of a persistent device buffer.
+! **************************************************************************************************
+   SUBROUTINE dbcsr_acc_device_buffer_sync(this)
+      TYPE(dbcsr_acc_device_buffer_type), INTENT(IN)    :: this
+
+#if defined (__DBCSR_ACC)
+      IF (this%initialized) CALL acc_stream_synchronize(this%stream)
+#else
+      MARK_USED(this)
+#endif
+   END SUBROUTINE dbcsr_acc_device_buffer_sync
+
+! **************************************************************************************************
+!> \brief Copies a 1D host array into a persistent device buffer.
+! **************************************************************************************************
+   SUBROUTINE dbcsr_acc_device_buffer_h2d_r8_1d(this, host)
+      TYPE(dbcsr_acc_device_buffer_type), INTENT(IN)    :: this
+      REAL(KIND=real_8), DIMENSION(:), INTENT(IN), &
+         TARGET                                          :: host
+      REAL(KIND=real_8), DIMENSION(:), POINTER           :: host_p
+
+#if defined (__DBCSR_ACC)
+      DBCSR_ASSERT(this%initialized)
+      host_p => host
+      CALL acc_devmem_host2dev(this%devmem, host_p, stream=this%stream)
+#else
+      MARK_USED(this)
+      MARK_USED(host)
+#endif
+   END SUBROUTINE dbcsr_acc_device_buffer_h2d_r8_1d
+
+! **************************************************************************************************
+!> \brief Copies a persistent device buffer into a 1D host array.
+! **************************************************************************************************
+   SUBROUTINE dbcsr_acc_device_buffer_d2h_r8_1d(this, host)
+      TYPE(dbcsr_acc_device_buffer_type), INTENT(IN)    :: this
+      REAL(KIND=real_8), DIMENSION(:), INTENT(OUT), &
+         TARGET                                          :: host
+      REAL(KIND=real_8), DIMENSION(:), POINTER           :: host_p
+
+#if defined (__DBCSR_ACC)
+      DBCSR_ASSERT(this%initialized)
+      host_p => host
+      CALL acc_devmem_dev2host(this%devmem, host_p, stream=this%stream)
+#else
+      MARK_USED(this)
+      MARK_USED(host)
+#endif
+   END SUBROUTINE dbcsr_acc_device_buffer_d2h_r8_1d
+
+! **************************************************************************************************
+!> \brief Copies a 2D host array into a persistent device buffer (row-major flattening as stored).
+! **************************************************************************************************
+   SUBROUTINE dbcsr_acc_device_buffer_h2d_r8_2d(this, host)
+      TYPE(dbcsr_acc_device_buffer_type), INTENT(IN)    :: this
+      REAL(KIND=real_8), DIMENSION(:, :), INTENT(IN), &
+         TARGET                                          :: host
+      REAL(KIND=real_8), DIMENSION(:, :), POINTER       :: host_p
+
+#if defined (__DBCSR_ACC)
+      DBCSR_ASSERT(this%initialized)
+      host_p => host
+      CALL acc_devmem_host2dev(this%devmem, host_p, stream=this%stream)
+#else
+      MARK_USED(this)
+      MARK_USED(host)
+#endif
+   END SUBROUTINE dbcsr_acc_device_buffer_h2d_r8_2d
+
+! **************************************************************************************************
+!> \brief Copies a persistent device buffer into a 2D host array.
+! **************************************************************************************************
+   SUBROUTINE dbcsr_acc_device_buffer_d2h_r8_2d(this, host)
+      TYPE(dbcsr_acc_device_buffer_type), INTENT(IN)    :: this
+      REAL(KIND=real_8), DIMENSION(:, :), INTENT(OUT), &
+         TARGET                                          :: host
+      REAL(KIND=real_8), DIMENSION(:), POINTER           :: host_flat
+
+#if defined (__DBCSR_ACC)
+      DBCSR_ASSERT(this%initialized)
+      CALL C_F_POINTER(C_LOC(host(1, 1)), host_flat, (/SIZE(host)/))
+      CALL acc_devmem_dev2host(this%devmem, host_flat, stream=this%stream)
+#else
+      MARK_USED(this)
+      MARK_USED(host)
+#endif
+   END SUBROUTINE dbcsr_acc_device_buffer_d2h_r8_2d
 
 END MODULE dbcsr_api
